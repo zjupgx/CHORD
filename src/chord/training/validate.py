@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 import anndata
 import numpy as np
 import pandas as pd
@@ -12,7 +12,7 @@ def validate(model, val_loaders, device):
     1. Runs the model without masking.
     2. Collects cell embeddings batch by batch.
     3. Stores labels for all validation cells.
-    4. Saves prototype embeddings and gene embeddings once per species.
+    4. Saves cell-type embeddings and gene embeddings once per species.
 
     Args:
         model:
@@ -25,7 +25,7 @@ def validate(model, val_loaders, device):
     Returns:
         Dictionary mapping species name to:
             - cell_embed: concatenated cell embeddings
-            - cell_type_embed: prototype embeddings
+            - cell_type_embed: cell-type embeddings
             - gene_embed: gene embeddings
             - labels: concatenated cell labels
     """
@@ -75,14 +75,14 @@ def organize_result(
     species_time_dict=None
 ):
     """
-    Organize validation outputs into AnnData objects for cells/prototypes
+    Organize validation outputs into AnnData objects for cells, cell types,
     and genes.
 
     This function creates:
-    1. One AnnData object containing both cell embeddings and prototype
+    1. One AnnData object containing both cell embeddings and cell-type
        embeddings.
     2. One AnnData object containing gene embeddings.
-    3. A list of species-specific prototype labels.
+    3. A list of species-specific cell-type labels.
 
     If `species_time_dict` is provided, the time annotation is added to
     cell observations and checked against the number of cells.
@@ -102,15 +102,15 @@ def organize_result(
 
     Returns:
         adata_cell:
-            AnnData containing both cell and prototype embeddings.
+            AnnData containing both cell and cell-type embeddings.
         adata_gene:
             AnnData containing gene embeddings.
     """
-    species_order, num_prototypes_per_species, all_type_labels = [], [], []
-    cell_proto_embeddings, obs_cell_proto, index_cell_proto = [], [], []
+    species_order, num_celltypes_per_species, all_type_labels = [], [], []
+    cell_celltype_embeddings, obs_cell_celltype, index_cell_celltype = [], [], []
     gene_embeddings, obs_genes, index_genes = [], [], []
 
-    cell_counter = proto_counter = gene_counter = 0
+    cell_counter = celltype_counter = gene_counter = 0
 
     for species in result:
         species_order.append(species)
@@ -119,7 +119,7 @@ def organize_result(
         cell_embeddings = result[species]["cell_embed"]
         cell_labels = result[species]["labels"]
         n_cells = len(cell_embeddings)
-        cell_proto_embeddings.append(cell_embeddings)
+        cell_celltype_embeddings.append(cell_embeddings)
 
         # Read and validate optional time annotations for cells
         time_series = None
@@ -147,19 +147,19 @@ def organize_result(
             if time_series is not None:
                 row["Time"] = time_series[i]
 
-            obs_cell_proto.append(row)
-            index_cell_proto.append(f"cell_{cell_counter}")
+            obs_cell_celltype.append(row)
+            index_cell_celltype.append(f"cell_{cell_counter}")
             cell_counter += 1
 
-        # ---------------- Prototype embeddings ----------------
+        # ---------------- Cell-type embeddings ----------------
         sp_mask = torch.tensor(
             species_expr_avg[species]["cell_type_presence"], dtype=torch.bool
         )
-        num_proto = int(sp_mask.sum().item())
-        num_prototypes_per_species.append(num_proto)
+        num_celltype = int(sp_mask.sum().item())
+        num_celltypes_per_species.append(num_celltype)
 
         type_embeddings = result[species]["cell_type_embed"][sp_mask]
-        cell_proto_embeddings.append(type_embeddings)
+        cell_celltype_embeddings.append(type_embeddings)
 
         for i, present in enumerate(sp_mask):
             if present:
@@ -167,15 +167,15 @@ def organize_result(
                 label_str = f"{species}_{cell_type_name}"
                 all_type_labels.append(label_str)
 
-                obs_cell_proto.append({
+                obs_cell_celltype.append({
                     "species": species,
                     "cell_type": cell_type_name,
-                    "item_type": "prototype",
+                    "item_type": "celltype",
                     "label_str": label_str,
                     "Time": None
                 })
-                index_cell_proto.append(f"proto_{proto_counter}")
-                proto_counter += 1
+                index_cell_celltype.append(f"celltype_{celltype_counter}")
+                celltype_counter += 1
 
         # ---------------- Gene embeddings ----------------
         gene_embeddings.append(result[species]["gene_embed"])
@@ -188,18 +188,18 @@ def organize_result(
             index_genes.append(f"gene_{gene_counter}")
             gene_counter += 1
 
-    # ---------------- Cell + prototype AnnData ----------------
-    cell_proto_embedding = np.concatenate(cell_proto_embeddings)
+    # ---------------- Cell + cell-type AnnData ----------------
+    cell_celltype_embedding = np.concatenate(cell_celltype_embeddings)
     adata_cell = anndata.AnnData(
-        X=cell_proto_embedding,
-        obs=pd.DataFrame(obs_cell_proto, index=index_cell_proto),
+        X=cell_celltype_embedding,
+        obs=pd.DataFrame(obs_cell_celltype, index=index_cell_celltype),
         dtype=np.float32
     )
 
     adata_cell.uns.update({
         "species_order": species_order,
         "global_cell_types": global_cell_types,
-        "num_prototypes_per_species": num_prototypes_per_species,
+        "num_celltypes_per_species": num_celltypes_per_species,
         "all_type_labels": all_type_labels
     })
 

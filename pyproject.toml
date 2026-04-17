@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "chord"
 version = "0.1.0"
-description = "Cross-species prototype-based single-cell integration and cell-type relationship inference"
+description = "CHORD (Cross-species Hierarchical Orthologous Relationship Discovery) is a cross-species integration framework for joint representation learning across gene, cell and cell-type levels."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [

@@ -42,4 +42,4 @@ data:
 output:
   outdir: results
   model_filename: fish_frog.pth
-  model_record_filename: stage2_proto_history.npy
+  model_record_filename: stage2_cell_type_embedding_history.npy

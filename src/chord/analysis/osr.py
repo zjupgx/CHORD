@@ -1,4 +1,4 @@
-import warnings
+﻿import warnings
 from typing import Dict, List, Sequence, Set, Tuple
 
 import numpy as np
@@ -268,10 +268,10 @@ def open_curve_acc(
     return_style: str = "dict",
 ):
     """
-    Open-set evaluation with prototype-based classification.
+    Open-set evaluation with cell-type-embedding-based classification.
     """
     q_mask = (adata.obs["species"] == species_Q) & (adata.obs[item_key] == "cell")
-    r_mask = (adata.obs["species"] == species_R) & (adata.obs[item_key] == "prototype")
+    r_mask = (adata.obs["species"] == species_R) & (adata.obs[item_key] == "celltype")
 
     if q_mask.sum() == 0:
         warnings.warn(f"[{species_Q}] no cell data found")
@@ -287,7 +287,7 @@ def open_curve_acc(
         }
 
     if r_mask.sum() == 0:
-        warnings.warn(f"[{species_R}] no prototype data found")
+        warnings.warn(f"[{species_R}] no cell-type embedding data found")
         if return_style == "legacy":
             return (np.array([]),) * 4
         return {

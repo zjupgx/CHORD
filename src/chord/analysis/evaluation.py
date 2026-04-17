@@ -1,4 +1,4 @@
-from sklearn.metrics import silhouette_score, silhouette_samples
+﻿from sklearn.metrics import silhouette_score, silhouette_samples
 import scanpy as sc
 import scib.metrics as sm
 from scipy.stats import spearmanr
@@ -41,7 +41,7 @@ def evaluate_celltype(
     Returns:
         best_nmi, asw, best_ari
     """
-    # Keep only cells if both cells and prototypes are present
+    # Keep only cells if both cells and cell-type embeddings are present
     if "item_type" in adata.obs.columns:
         adata_work = adata[adata.obs["item_type"] == "cell"].copy()
     else:
@@ -51,9 +51,9 @@ def evaluate_celltype(
     sc.pp.neighbors(adata_work, n_neighbors=n_neighbors, use_rep=rep, random_state=seed)
 
     best_nmi = best_ari = 0.0
-    for γ in gammas:
-        key = f"leiden_{γ:.2f}"
-        sc.tl.leiden(adata_work, resolution=γ, key_added=key, random_state=seed)
+    for gamma in gammas:
+        key = f"leiden_{gamma:.2f}"
+        sc.tl.leiden(adata_work, resolution=gamma, key_added=key, random_state=seed)
         best_nmi = max(best_nmi, sm.nmi(adata_work, key, "cell_type"))
         best_ari = max(best_ari, sm.ari(adata_work, key, "cell_type"))
 
@@ -123,15 +123,15 @@ def calculate_species_overlap(adata, species_Q, species_R):
 
     The score is defined as:
         1 - (number of cells in species_Q whose cell types do not have
-             matching prototypes in species_R) / (total number of cells in species_Q)
+             matching cell-type embeddings in species_R) / (total number of cells in species_Q)
 
     Args:
         adata:
-            AnnData containing both cells and prototypes.
+            AnnData containing both cells and cell-type embeddings.
         species_Q:
             Query species whose cells are evaluated.
         species_R:
-            Reference species providing prototype labels.
+            Reference species providing cell-type embedding labels.
 
     Returns:
         overlap_score:
@@ -141,11 +141,11 @@ def calculate_species_overlap(adata, species_Q, species_R):
     q_cell_mask = (adata.obs['species'] == species_Q) & (adata.obs['item_type'] == 'cell')
     q_cell_types = set(adata.obs.loc[q_cell_mask, 'cell_type'].unique())
     
-    # Cell types present among prototypes of species R
-    r_proto_mask = (adata.obs['species'] == species_R) & (adata.obs['item_type'] == 'prototype')
-    r_cell_types = set(adata.obs.loc[r_proto_mask, 'cell_type'].unique())
+    # Cell types present among cell-type embeddings of species R
+    r_celltype_mask = (adata.obs['species'] == species_R) & (adata.obs['item_type'] == 'celltype')
+    r_cell_types = set(adata.obs.loc[r_celltype_mask, 'cell_type'].unique())
     
-    # Cell types in species Q that are absent from species-R prototypes
+    # Cell types in species Q that are absent from species-R cell-type embeddings
     unique_q_types = q_cell_types - r_cell_types
     
     # Count cells in species Q that belong to these unmatched cell types
@@ -174,27 +174,27 @@ def transfer_labels_across_species(
     return_confusion_matrix=True
 ):
     """
-    Evaluate cross-species label transfer using prototype similarity.
+    Evaluate cross-species label transfer using cell-type embedding similarity.
 
     This function:
     1. Uses cells from `species_Q` as query samples.
-    2. Uses prototypes from `species_R` as reference labels.
-    3. Assigns each query cell to the most similar reference prototype
+    2. Uses cell-type embeddings from `species_R` as reference labels.
+    3. Assigns each query cell to the most similar reference cell-type embedding
        using cosine similarity.
     4. Reports both intersection-based and union-based evaluation metrics.
 
     Args:
         adata:
-            AnnData containing cells and prototypes.
+            AnnData containing cells and cell-type embeddings.
         species_Q:
             Query species whose cells will be classified.
         species_R:
-            Reference species providing prototype labels.
+            Reference species providing cell-type embedding labels.
         averages:
             F1 averaging modes to report.
         restrict_to_intersection:
             If True, use only cells whose true labels are also present
-            in the reference prototype label set when selecting the main result.
+            in the reference cell-type embedding label set when selecting the main result.
         return_confusion_matrix:
             Whether to include a confusion-matrix DataFrame.
 
@@ -219,32 +219,32 @@ def transfer_labels_across_species(
         q_cell_embeddings = np.asarray(qX)
     y_true_all = adata.obs.loc[q_cell_mask, 'cell_type'].astype(str).values
 
-    # 2) Reference prototypes from species R
-    r_proto_mask = (adata.obs['species'] == species_R) & (adata.obs['item_type'] == 'prototype')
-    if np.sum(r_proto_mask) == 0:
-        print(f"Error: species {species_R} has no prototype data")
+    # 2) Reference cell-type embeddings from species R
+    r_celltype_mask = (adata.obs['species'] == species_R) & (adata.obs['item_type'] == 'celltype')
+    if np.sum(r_celltype_mask) == 0:
+        print(f"Error: species {species_R} has no cell-type embedding data")
         return {}
 
-    rX = adata[r_proto_mask].X
+    rX = adata[r_celltype_mask].X
     if sparse.issparse(rX):
-        r_proto_embeddings = rX.A
+        r_celltype_embeddings = rX.A
     else:
-        r_proto_embeddings = np.asarray(rX)
-    r_proto_labels = adata.obs.loc[r_proto_mask, 'cell_type'].astype(str).values
+        r_celltype_embeddings = np.asarray(rX)
+    r_celltype_labels = adata.obs.loc[r_celltype_mask, 'cell_type'].astype(str).values
 
-    # 3) Cosine similarity and nearest-prototype assignment
-    sim = cosine_similarity(q_cell_embeddings, r_proto_embeddings)
+    # 3) Cosine similarity and nearest-cell-type assignment
+    sim = cosine_similarity(q_cell_embeddings, r_celltype_embeddings)
     max_idx = np.argmax(sim, axis=1)
-    y_pred_all = r_proto_labels[max_idx]
+    y_pred_all = r_celltype_labels[max_idx]
 
     # Label-set relationships and coverage summary
     true_set = set(y_true_all)
-    proto_set = set(r_proto_labels)
-    inter_set = true_set & proto_set
+    celltype_set = set(r_celltype_labels)
+    inter_set = true_set & celltype_set
     coverage = {
-        "true_in_proto_coverage": (len(inter_set) / len(true_set)) if len(true_set) else 0.0,
-        "true_only_labels": sorted(true_set - proto_set),
-        "proto_only_labels": sorted(proto_set - true_set),
+        "true_in_celltype_coverage": (len(inter_set) / len(true_set)) if len(true_set) else 0.0,
+        "true_only_labels": sorted(true_set - celltype_set),
+        "celltype_only_labels": sorted(celltype_set - true_set),
     }
 
     # ---------- A) Intersection evaluation ----------
@@ -309,8 +309,8 @@ def transfer_labels_across_species(
         mode_name = f"{species_R} -> {species_Q} | union evaluation"
 
     print(f"Cross-species prediction {mode_name}")
-    print(f"- true_in_proto coverage: {coverage['true_in_proto_coverage']:.4f}  "
-          f"(true-only: {coverage['true_only_labels']}, proto-only: {coverage['proto_only_labels']})")
+    print(f"- true_in_celltype coverage: {coverage['true_in_celltype_coverage']:.4f}  "
+          f"(true-only: {coverage['true_only_labels']}, celltype-only: {coverage['celltype_only_labels']})")
     print(f"- Accuracy: {main_metrics['accuracy']:.4f}")
     for avg in averages:
         print(f"- F1-{avg}: {main_metrics['f1'][avg]:.4f}")
@@ -321,3 +321,4 @@ def transfer_labels_across_species(
         "metrics_intersection": metrics_intersection,
         "metrics_union": metrics_union,
     }
+

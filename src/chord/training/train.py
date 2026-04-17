@@ -1,4 +1,4 @@
-import numpy as np
+﻿import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -95,9 +95,9 @@ def train(
     ``homology_indices``, and saves the best model checkpoint according to the
     summed training loss.
 
-    During training, the function can optionally record the prototype embedding
+    During training, the function can optionally record the cell-type embedding
     history from the last ``record_last_k_epochs`` epochs. These recorded
-    prototype snapshots can be used for downstream consensus tree construction
+    cell-type embedding snapshots can be used for downstream consensus tree construction
     or stability analysis.
 
     Parameters
@@ -126,16 +126,16 @@ def train(
         Path for saving the best model checkpoint. If None, the best model is
         not saved.
     record_last_k_epochs : int or None, default=None
-        If not None, record prototype embeddings from the last
-        ``record_last_k_epochs`` epochs. If None, no prototype history is
+        If not None, record cell-type embeddings from the last
+        ``record_last_k_epochs`` epochs. If None, no cell-type embedding history is
         recorded.
 
     Returns
     -------
-    proto_history : list[np.ndarray] or None
-        If ``record_last_k_epochs`` is not None, returns a list of prototype
+    cell_type_embedding_history : list[np.ndarray] or None
+        If ``record_last_k_epochs`` is not None, returns a list of cell-type
         embedding snapshots from the last training epochs. Each element is
-        typically a concatenated prototype embedding array across species.
+        typically a concatenated cell-type embedding array across species.
         If ``record_last_k_epochs`` is None, returns None.
     """
     model.train()
@@ -178,7 +178,7 @@ def train(
             )
         s.append(s_truth)
 
-    proto_history = [] if record_last_k_epochs is not None else None
+    cell_type_embedding_history = [] if record_last_k_epochs is not None else None
 
     for epoch in range(epochs):
         total_loss1 = 0.0
@@ -237,12 +237,12 @@ def train(
                 print(f"Model has been saved to: {model_save_path}")
 
         if record_last_k_epochs is not None and epoch >= epochs - record_last_k_epochs:
-            proto_embeddings = []
+            celltype_embeddings = []
             for species in expr_avg.keys():
                 sp_mask = torch.tensor(expr_avg[species]["cell_type_presence"], dtype=torch.bool)
                 type_embeddings = outputs[species]["cell_type_embed"][sp_mask]
-                proto_embeddings.append(type_embeddings.detach().cpu().numpy())
+                celltype_embeddings.append(type_embeddings.detach().cpu().numpy())
 
-            proto_history.append(np.concatenate(proto_embeddings, axis=0))
+            cell_type_embedding_history.append(np.concatenate(celltype_embeddings, axis=0))
 
-    return proto_history
+    return cell_type_embedding_history

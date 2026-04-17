@@ -256,7 +256,7 @@ def run_pipeline(cfg: dict[str, Any]) -> None:
     )
     optimizer2 = torch.optim.Adam(model.parameters(), lr=stage2_cfg["lr"])
 
-    proto_history = train(
+    cell_type_embedding_history = train(
         model,
         dataloader,
         species_expr_avg,
@@ -269,9 +269,9 @@ def run_pipeline(cfg: dict[str, Any]) -> None:
         record_last_k_epochs=record_last_k_epochs,
     )
 
-    if proto_history is not None:
-        np.save(outdir / "stage2_proto_history.npy", np.stack(proto_history, axis=0))
-        print(f"Model record file: {outdir / 'stage2_proto_history.npy'}")
+    if cell_type_embedding_history is not None:
+        np.save(outdir / "stage2_cell_type_embedding_history.npy", np.stack(cell_type_embedding_history, axis=0))
+        print(f"Model record file: {outdir / 'stage2_cell_type_embedding_history.npy'}")
     
     print("Stage 2 training completed.")
     

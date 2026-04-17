@@ -113,7 +113,7 @@ python -m chord.run_training --config /path/to/config.yaml
 After training, CHORD saves the following outputs to `output.outdir`:
 
 - `best_model.pth`: best model checkpoint
-- `stage2_proto_history.npy`: prototype history recorded in stage 2
+- `stage2_cell_type_embedding_history.npy`: cell-type embedding history recorded in stage 2
 - `adata_cell_embeddings.h5ad`: cell and cell-type embeddings
 - `adata_gene_embeddings.h5ad`: gene embeddings
 

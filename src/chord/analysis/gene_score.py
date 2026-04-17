@@ -1,4 +1,4 @@
-import numpy as np
+﻿import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -13,7 +13,7 @@ def compute_gene_grad_importance_all(
     dataloader,
     species,
     device,
-    target_proto: int = 0,
+    target_celltype: int = 0,
     focus_on_type: bool = True,
 ):
     """
@@ -39,17 +39,17 @@ def compute_gene_grad_importance_all(
         model.zero_grad()
         outputs = model({species: (cells_in, labels)}, device)
         cell_emb = outputs[species]["cell_embed"]
-        proto_emb = outputs[species]["cell_type_embed"]
+        celltype_emb = outputs[species]["cell_type_embed"]
 
-        proto_vec = proto_emb[target_proto].unsqueeze(0)
+        celltype_vec = celltype_emb[target_celltype].unsqueeze(0)
 
         if focus_on_type:
-            mask = labels == target_proto
+            mask = labels == target_celltype
             if mask.sum() == 0:
                 continue
-            sim = F.cosine_similarity(cell_emb[mask], proto_vec, dim=-1).mean()
+            sim = F.cosine_similarity(cell_emb[mask], celltype_vec, dim=-1).mean()
         else:
-            sim = F.cosine_similarity(cell_emb, proto_vec, dim=-1).mean()
+            sim = F.cosine_similarity(cell_emb, celltype_vec, dim=-1).mean()
 
         sim.backward()
 
@@ -104,7 +104,7 @@ def compare_gene_importance_cross_species(
     species_config,
     homology_indices,
     device="cuda",
-    target_proto: int = 0,
+    target_celltype: int = 0,
     focus_on_type: bool = True,
 ):
     """
@@ -127,7 +127,7 @@ def compare_gene_importance_cross_species(
             dataloader=dataloader,
             species=species,
             device=device,
-            target_proto=target_proto,
+            target_celltype=target_celltype,
             focus_on_type=focus_on_type,
         )
         per_species[species] = imp
