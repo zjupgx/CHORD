@@ -1,0 +1,45 @@
+model:
+  embed_dim: 128
+  hidden_dim: 128
+
+training:
+  batch_size: 256
+  device: auto
+
+  stage1:
+    loss_weight: [1.0, 0.0, 0.0]
+    temperature: 0.1
+    lr: 0.001
+    epochs: 100
+
+  stage2:
+    loss_weight: [10.0, 0.1, 0.1]
+    temperature: 0.1
+    lr: 0.005
+    epochs: 200
+    record_last_k_epochs: 50
+
+data:
+  n_HVG: 2000
+  cpm: 10000
+
+  species:
+    - name: fish
+      h5ad: /your_path.h5ad
+      label_col: cell_type
+      is_preprocessed: true
+
+    - name: frog
+      h5ad: /your_path.h5ad
+      label_col: cell_type
+      is_preprocessed: true
+
+  homology:
+    - species1: fish
+      species2: frog
+      path: /your_path.csv
+
+output:
+  outdir: results
+  model_filename: fish_frog.pth
+  model_record_filename: stage2_proto_history.npy
