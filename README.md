@@ -120,3 +120,24 @@ After training, CHORD saves the following outputs to `output.outdir`:
 ### Downstream Analysis
 
 After training, you can use the analysis notebook to explore CHORD results. The notebook loads saved cell and gene embeddings from `output.outdir` for downstream analyses.
+
+## 📄 License
+
+The CHORD source code is available under the GPL-3.0 license.
+
+See the `LICENSE` file for details.
+
+## 🔁 Reproducibility
+
+The analysis scripts used to reproduce the results reported in the manuscript are archived on Zenodo: 
+
+https://doi.org/10.5281/zenodo.20281628
+
+## 📝 Citation
+
+If you use CHORD in your research, please cite the associated preprint:
+
+Yitao Lin, Xunuo Zhu, Xuheng Zhou, Xue Zhang, Guoxin Cai, Wenyi Zhao, Jingqi Zhou, Jie Liu, Qiang Zhu, Menghan Zhang, Binbin Zhou, Xun Gu, and Zhan Zhou.  
+CHORD: a framework for cross-species single-cell integration across gene, cell and cell-type levels.  
+bioRxiv 2026.04.19.719426.  
+https://doi.org/10.64898/2026.04.19.719426

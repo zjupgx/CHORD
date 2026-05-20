@@ -5,8 +5,8 @@ from typing import Any
 
 import torch
 
-from chord.models import CrossSpeciesPrototypeModel
-from chord.preprocessing import (
+from ..models import CrossSpeciesPrototypeModel
+from ..preprocessing import (
     data_preprocess,
     prepare_multispecies_data,
     get_homology_indices,

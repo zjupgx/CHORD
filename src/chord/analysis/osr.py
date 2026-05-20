@@ -1,5 +1,5 @@
 ﻿import warnings
-from typing import Dict, List, Sequence, Set, Tuple
+from typing import Dict, List, Sequence, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -121,6 +121,91 @@ def osr_split_simple(
         )
 
     return splits
+
+
+def split_and_filter_by_hvg(
+    species_adatas: Dict[str, Tuple[sc.AnnData, str]],
+    splits: Dict[str, Dict[str, Tuple[Union[sc.AnnData, List[str]], str]]],
+    n_top_genes: int = 2000,
+    hvg_flavor: str = 'seurat'
+) -> Dict[str, Dict[str, Tuple[sc.AnnData, str]]]:
+    """
+    Split AnnData by species and cell lists, select highly variable genes based on the training set,
+    and apply the selected genes to both training and test sets.
+
+    Parameters:
+    ----------
+    species_adatas : dict
+        A dictionary where keys are species names (str), and values are tuples containing the full
+        AnnData object and the label key (str).
+        Example: {'human': (adata_human, 'cell_type')}
+
+    splits : dict
+        A dictionary defining how to split the training and test sets.
+        Structure: {'train': {species: (cell list or AnnData, label key)}, 
+                    'test': {species: (cell list or AnnData, label key)}}
+    
+    n_top_genes : int, optional (default: 2000)
+        Number of highly variable genes to select.
+
+    hvg_flavor : str, optional (default: 'seurat_v3')
+        The 'flavor' parameter passed to sc.pp.highly_variable_genes.
+
+    Returns:
+    -------
+    Dict[str, Dict[str, Tuple[sc.AnnData, str]]]
+        A dictionary containing the processed training and test AnnData objects.
+        These AnnData objects contain only the highly variable genes identified from
+        the training set of the corresponding species.
+    """
+    
+    # --- Step 1: Split AnnData based on cell lists ---
+    print("Step 1: Splitting data based on cell lists...")
+    split_adatas = {'train': {}, 'test': {}}
+    for split_name in ['train', 'test']:
+        for species, (cells_or_adata, label_key) in splits[split_name].items():
+            full_adata, _ = species_adatas[species]
+
+            if isinstance(cells_or_adata, sc.AnnData):
+                cell_list = list(cells_or_adata.obs_names)
+            else:
+                cell_list = cells_or_adata
+
+            matched_cells = [cell for cell in cell_list if cell in full_adata.obs_names]
+            if len(matched_cells) < len(cell_list):
+                missing = set(cell_list) - set(matched_cells)
+                print(f"[Warning] In species {species}, {split_name} split, the following cells were not found in AnnData: {list(missing)}")
+            
+            sub_adata = full_adata[matched_cells].copy()
+            split_adatas[split_name][species] = (sub_adata, label_key)
+
+    # --- Step 2: Select highly variable genes from the training set ---
+    print(f"\nStep 2: Selecting {n_top_genes} highly variable genes for the training set...")
+    highly_variable_genes = {}
+    for species, (train_adata, _) in split_adatas['train'].items():
+        print(f"  - Processing species: {species}")
+        sc.pp.highly_variable_genes(train_adata, flavor=hvg_flavor, n_top_genes=n_top_genes)
+        hvg_list = train_adata.var[train_adata.var['highly_variable']].index.tolist()
+        highly_variable_genes[species] = hvg_list
+        print(f"    -> Selected {len(hvg_list)} genes for species {species}.")
+
+    # --- Step 3: Apply highly variable genes to both training and test sets ---
+    print("\nStep 3: Applying highly variable genes to all data subsets...")
+    final_adatas = {'train': {}, 'test': {}}
+    
+    # Apply to the training set
+    for species, (train_adata, label_key) in split_adatas['train'].items():
+        hvg_list = highly_variable_genes[species]
+        final_adatas['train'][species] = (train_adata[:, hvg_list].copy(), label_key)
+
+    # Apply to the test set
+    for species, (test_adata, label_key) in split_adatas['test'].items():
+        hvg_for_species = highly_variable_genes[species]
+        available_hvg = [gene for gene in hvg_for_species if gene in test_adata.var_names]
+        final_adatas['test'][species] = (test_adata[:, available_hvg].copy(), label_key)
+
+    print("\nProcessing completed!")
+    return final_adatas
 
 
 def collect_label_ids(
@@ -467,3 +552,77 @@ def open_compact(
         del adata.obs[leiden_key]
 
     return best
+
+def plot_unknown_assignment_vs_ccr_pdf(
+    results, filename="oscr_plot.pdf", width=8.0, height=8.0, unit="inch",
+    dpi=300, font_family="Arial", fontsize=7, linewidth=0.7,
+    pad_inches=0.02, left=0.14, right=0.98, top=0.96, bottom=0.14,
+    title="OSCR (Open-Set Performance)",
+    operating_rule=None
+):
+    import numpy as np, matplotlib as mpl, matplotlib.pyplot as plt
+
+    if unit.lower() == "cm":
+        width_in, height_in = width/2.54, height/2.54
+    else:
+        width_in, height_in = float(width), float(height)
+
+    mpl.rcParams["font.family"] = font_family
+    mpl.rcParams["pdf.fonttype"] = 42; mpl.rcParams["ps.fonttype"] = 42
+    mpl.rcParams["figure.dpi"] = dpi
+
+    fig, ax = plt.subplots(figsize=(width_in, height_in))
+    spine_w = 0.4
+    auc_texts = []
+
+    for name, res, color in results:
+        oscr = res.get("oscr_points")
+        if oscr is None or len(oscr) == 0: continue
+        fpr = oscr[:,0]; ccr = oscr[:,1]
+        x = 1.0 - fpr; y = ccr
+        m = np.isfinite(x) & np.isfinite(y)
+        x = x[m]; y = y[m]
+        order = np.argsort(x)
+        x = x[order]; y = y[order]
+
+        auc = float(np.trapz(y, x))
+        auc_texts.append((name, auc))
+
+        ax.step(x, y, where="post", label=f"{name}",
+                color=color, linewidth=linewidth+0.3)
+        
+        if operating_rule is not None:
+            if "fpr_cap" in operating_rule:
+            
+                cap = operating_rule["fpr_cap"]
+                ok = (1.0 - x) <= cap
+                if np.any(ok):
+                    i = int(np.argmax(y * ok))
+                else:
+                    i = int(np.argmin(1.0 - x)) 
+            elif "recall_unknown" in operating_rule:
+                target = operating_rule["recall_unknown"]
+                i = int(np.argmin(np.abs(x - target)))
+            else:
+                i = None
+            if i is not None:
+                ax.plot([x[i]], [y[i]], marker="o", ms=3, color=color)
+
+    ax.set_xlim(0,1); ax.set_ylim(0,1)
+    ax.set_xlabel("Recall on Unknown", fontsize=fontsize)
+    ax.set_ylabel("CCR on Known", fontsize=fontsize)
+    ax.set_title(title, fontsize=fontsize+1)
+    for s in ("top","right","bottom","left"):
+        ax.spines[s].set_visible(True)
+        ax.spines[s].set_linewidth(spine_w)
+        ax.spines[s].set_edgecolor("black")
+    ax.tick_params(labelsize=fontsize, width=spine_w, length=2, direction="out")
+
+    leg = ax.legend(loc="upper right", fontsize=fontsize-1,
+                    frameon=True, framealpha=0, borderpad=0.2)
+    leg.get_frame().set_linewidth(spine_w)
+
+    fig.subplots_adjust(left=left, right=right, top=top, bottom=bottom)
+    fig.savefig(filename, dpi=dpi, bbox_inches="tight", pad_inches=pad_inches)
+    plt.close(fig)
+    return filename

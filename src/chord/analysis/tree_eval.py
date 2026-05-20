@@ -8,6 +8,9 @@ from scipy.cluster.hierarchy import fcluster, linkage, to_tree
 from scipy.spatial.distance import squareform
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from sklearn.metrics.pairwise import cosine_distances
+import pandas as pd
+from datetime import datetime
+from .evaluation import transfer_labels_across_species
 
 
 def core_type_label(name: str) -> str:
@@ -71,24 +74,6 @@ def reorder_embeddings(
     order = [label2idx[l] for l in row_labels]
     return emb[order]
 
-
-def extract_clusters_by_label(
-    Z: np.ndarray,
-    labels_master: Sequence[str],
-) -> set[frozenset[str]]:
-    """
-    Extract all internal clusters from a hierarchical tree as sets of labels.
-    """
-    n = len(labels_master)
-    _, nodes = to_tree(Z, rd=True)
-
-    return {
-        frozenset(labels_master[j] for j in node.pre_order())
-        for node in nodes
-        if node.count < n
-    }
-
-
 def consensus_linkage_wo_na(
     embeddings_list: Sequence[np.ndarray],
     labels_master: Sequence[str],
@@ -151,36 +136,6 @@ def consensus_linkage_wo_na(
     Z_main = linkage(squareform(D_avg, checks=False), method=method)
     return Z_main
 
-
-def single_embedding_linkage_wo_na(
-    embedding: np.ndarray,
-    labels_master: Sequence[str],
-    row_labels: Sequence[str] | None = None,
-    method: str = "ward",
-    nas: Sequence[int] | None = None,
-) -> np.ndarray:
-    """
-    Build a linkage matrix from a single embedding matrix after optional
-    reordering and NA filtering.
-    """
-    n_labels = len(labels_master)
-    label2idx_master = {lab: i for i, lab in enumerate(labels_master)}
-
-    if row_labels is not None:
-        embedding = reorder_embeddings(embedding, row_labels, label2idx_master)
-
-    if nas is None:
-        idx_keep = list(range(n_labels))
-    else:
-        nas_set = set(nas)
-        idx_keep = [i for i in range(n_labels) if i not in nas_set]
-
-    emb_eval = embedding[idx_keep, :]
-    euc = np.sqrt(2.0 * cosine_distances(emb_eval))
-    Z = linkage(squareform(euc, checks=False), method=method)
-    return Z
-
-
 def evaluate_tree_clustering(
     Z: np.ndarray,
     truth_ids: Sequence[int],
@@ -213,40 +168,6 @@ def evaluate_tree_clustering(
         "ari": float(ari),
     }
 
-
-def evaluate_single_embedding_tree(
-    embedding: np.ndarray,
-    all_type_labels: Sequence[str],
-    n_clusters: int,
-    *,
-    row_labels: Sequence[str] | None = None,
-    method: str = "ward",
-) -> dict[str, object]:
-    """
-    Full pipeline for a single embedding matrix:
-    normalize labels -> remove NA -> build tree -> evaluate clustering.
-    """
-    truth_labels, truth_ids, label2id, nas = tag_labels(all_type_labels)
-
-    Z = single_embedding_linkage_wo_na(
-        embedding=embedding,
-        labels_master=all_type_labels,
-        row_labels=row_labels,
-        method=method,
-        nas=nas,
-    )
-    metrics = evaluate_tree_clustering(Z, truth_ids=truth_ids, n_clusters=n_clusters)
-
-    return {
-        "truth_labels": truth_labels,
-        "truth_ids": truth_ids,
-        "label2id": label2id,
-        "nas": nas,
-        "Z": Z,
-        **metrics,
-    }
-
-
 def evaluate_consensus_embedding_tree(
     embeddings_list: Sequence[np.ndarray],
     all_type_labels: Sequence[str],
@@ -259,7 +180,7 @@ def evaluate_consensus_embedding_tree(
     Full pipeline for multiple embedding snapshots:
     normalize labels -> remove NA -> consensus tree -> evaluate clustering.
     """
-    truth_labels, truth_ids, label2id, nas = tag_labels(all_type_labels)
+    _, truth_ids, label2id, nas = tag_labels(all_type_labels)
 
     Z = consensus_linkage_wo_na(
         embeddings_list=embeddings_list,
@@ -271,10 +192,27 @@ def evaluate_consensus_embedding_tree(
     metrics = evaluate_tree_clustering(Z, truth_ids=truth_ids, n_clusters=n_clusters)
 
     return {
-        "truth_labels": truth_labels,
-        "truth_ids": truth_ids,
         "label2id": label2id,
         "nas": nas,
-        "Z": Z,
         **metrics,
     }
+
+def eval_transfer_row(adata, species_src, species_tgt, model_name="", run_tag=None, include_confusion=False):
+    adata_sub = adata[adata.obs["cell_type"] != "NA"].copy()
+    res = transfer_labels_across_species(
+    adata_sub, species_src, species_tgt, return_confusion_matrix=include_confusion)
+    row = {
+    'timestamp': datetime.now().isoformat(timespec='seconds'),
+    'model': model_name,
+    'direction': f'{species_tgt} to {species_src}',
+    'run_tag': run_tag,
+    'src': species_src,
+    'tgt': species_tgt,
+    'n_cells': adata_sub.n_obs,
+    'accuracy': res.get('accuracy'),
+    'f1_micro': res['f1'].get('micro'),
+    'f1_macro': res['f1'].get('macro'),
+    'f1_weighted': res['f1'].get('weighted'),
+    }
+    cm = res.get('confusion_matrix') if include_confusion else None
+    return row, cm

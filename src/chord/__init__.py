@@ -35,8 +35,7 @@ from .analysis import (
     get_embedding_neighbors,
     compute_overlap_pval,
     batch_compute,
-    query_gene_neighbors,
-    human_mouse_ppi,
+    meta_on_ortholog_intersection,
     compute_gene_grad_importance_all,
     collect_gene_importance_homologous_triplets,
     compare_gene_importance_cross_species,
@@ -47,6 +46,7 @@ from .analysis import (
     open_curve_logistic,
     open_curve_acc,
     open_compact,
+    split_and_filter_by_hvg,
     plot_developmental_alignment,
     calculate_pseudo_tempo_for_species,
     calculate_pseudo_tempo,
@@ -63,14 +63,16 @@ from .analysis import (
     core_type_label,
     tag_labels,
     reorder_tree_eval_embeddings,
-    extract_tree_eval_clusters_by_label,
     consensus_linkage_wo_na,
-    single_embedding_linkage_wo_na,
     evaluate_tree_clustering,
-    evaluate_single_embedding_tree,
     evaluate_consensus_embedding_tree,
+    plot_unknown_assignment_vs_ccr_pdf,
+    eval_transfer_row
 )
-from .utils import load_chord_model_and_homology
+from .utils import (
+    load_chord_model_and_homology, 
+    plot_enrichment_barchart
+)
 
 __all__ = [
     "CrossSpeciesPrototypeModel",
@@ -108,8 +110,7 @@ __all__ = [
     "get_embedding_neighbors",
     "compute_overlap_pval",
     "batch_compute",
-    "query_gene_neighbors",
-    "human_mouse_ppi",
+    "meta_on_ortholog_intersection",
     "compute_gene_grad_importance_all",
     "collect_gene_importance_homologous_triplets",
     "compare_gene_importance_cross_species",
@@ -120,6 +121,7 @@ __all__ = [
     "open_curve_logistic",
     "open_curve_acc",
     "open_compact",
+    "split_and_filter_by_hvg",
     "plot_developmental_alignment",
     "calculate_pseudo_tempo_for_species",
     "calculate_pseudo_tempo",
@@ -136,11 +138,11 @@ __all__ = [
     "core_type_label",
     "tag_labels",
     "reorder_tree_eval_embeddings",
-    "extract_tree_eval_clusters_by_label",
     "consensus_linkage_wo_na",
-    "single_embedding_linkage_wo_na",
     "evaluate_tree_clustering",
-    "evaluate_single_embedding_tree",
     "evaluate_consensus_embedding_tree",
     "load_chord_model_and_homology",
+    "plot_enrichment_barchart",
+    "plot_unknown_assignment_vs_ccr_pdf",
+    "eval_transfer_row"
 ]

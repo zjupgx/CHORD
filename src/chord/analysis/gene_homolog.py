@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.stats import mannwhitneyu
+from ..utils.plot import pretty_boxplot
 
 
 def collect_homologous_triplets(homology_indices):

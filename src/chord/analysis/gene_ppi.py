@@ -7,6 +7,8 @@ import io
 from sklearn.metrics.pairwise import cosine_similarity
 import time
 from scipy.stats import hypergeom
+from scipy.stats import chi2
+from statsmodels.stats.multitest import multipletests
 
 
 def get_full_ppi(gene, species=9606, score_threshold=400):
@@ -188,88 +190,126 @@ def batch_compute(adata_gene, ppi_dict, species="human", top_n=30):
             print(f"[{i}/{len(background_genes)}] {gene} done.")
     return pd.DataFrame(results)
 
+def collect_homologous_triplets(homology_indices):
+    hm = homology_indices[("human", "mouse")]
+    triplets = []
+    h_to_m = dict(zip(hm[0], hm[1]))
+    for h_idx in h_to_m:
+        triplets.append((h_idx, h_to_m[h_idx]))
+    return triplets
 
-def query_gene_neighbors(adata_gene, gene_id, species, top_n=10):
-    """
-    Query the top-N nearest genes in the embedding space.
+def sanitize_symbol(x):
+    return str(x).strip().upper()
 
-    Parameters
-    ----------
-    adata_gene : AnnData
-        AnnData object with gene embeddings
-    gene_id : str
-        Target gene ID
-    species : str
-        Target species
-    top_n : int, optional
-        Number of neighbors to return (default=10)
-
-    Returns
-    -------
-    list
-        Top-N neighbor gene IDs, excluding the target gene itself
-    """
-    v_target = adata_gene[
-        (adata_gene.obs["gene_id"] == gene_id) & (adata_gene.obs["species"] == species)
-    ].X.reshape(1, -1)
-
-    adata_species = adata_gene[adata_gene.obs["species"] == species]
-    V_species = adata_species.X
-
-    sim = cosine_similarity(v_target, V_species).flatten()
-
-    top_idx = sim.argsort()[::-1]
-    top_idx = top_idx[top_idx != np.argmax(sim)]
-    top_idx = top_idx[:top_n]
-
-    top_genes = adata_species.obs["gene_id"].iloc[top_idx].tolist()
-    print(f"Top {top_n} neighbors of {gene_id} in {species} embedding:", top_genes)
-    return top_genes
-
-
-def human_mouse_ppi(df_results_human, df_results_mouse, homology_indices, adata_gene,
-                    human_species="human", mouse_species="mouse"):
-    """
-    Align human and mouse PPI overlap results based on homolog mapping.
-
-    Inputs
-    ------
-    df_results_human / df_results_mouse
-        DataFrames containing gene_id, overlap_count, pval, overlap_genes, pval_adj
-    homology_indices
-        dict[(human, mouse)] -> tuple(human_idx, mouse_idx)
-        Indices are relative to the species-specific subset
-    adata_gene
-        AnnData object with gene_id and species in .obs
-    human_species / mouse_species
-        Species names in adata_gene.obs["species"]
-    """
-    # 1. Build species-specific gene tables
-    human_gene_df = adata_gene[adata_gene.obs['species'] == human_species].copy()
-    mouse_gene_df = adata_gene[adata_gene.obs['species'] == mouse_species].copy()
-    
-    # Use continuous local indices to match homology_indices
-    human_idx_to_gene = pd.Series(human_gene_df.obs['gene_id'].values, index=range(len(human_gene_df))).to_dict()
-    mouse_idx_to_gene = pd.Series(mouse_gene_df.obs['gene_id'].values, index=range(len(mouse_gene_df))).to_dict()
-    
-    # 2. Build human -> mouse homolog mapping
-    hm = homology_indices[(human_species, mouse_species)]
-    h_to_m = {human_idx_to_gene[h]: mouse_idx_to_gene[m] for h, m in zip(hm[0], hm[1])}
-
-    # 3. Align overlap results
+def build_ortholog_map(species_config, homology_indices):
+    pairs = collect_homologous_triplets(homology_indices)
+    human_names = species_config["human"]["gene_names"]
+    mouse_names = species_config["mouse"]["gene_names"]
     records = []
-    for h_gene, m_gene in h_to_m.items():
-        h_row = df_results_human[df_results_human['gene_id'] == h_gene]
-        m_row = df_results_mouse[df_results_mouse['gene_id'] == m_gene]
-        if not h_row.empty and not m_row.empty:
-            records.append({
-                "human_gene": h_gene,
-                "mouse_gene": m_gene,
-                "human_overlap": h_row['overlap_count'].values[0],
-                "mouse_overlap": m_row['overlap_count'].values[0],
-                "human_pval_adj": h_row['pval_adj'].values[0],
-                "mouse_pval_adj": m_row['pval_adj'].values[0]
-            })
-    df_compare = pd.DataFrame(records)
-  
-    return df_compare
+    for h_idx, m_idx in pairs:
+        gh = str(human_names[h_idx])
+        gm = str(mouse_names[m_idx])
+        records.append({
+            "human_idx": int(h_idx),
+            "mouse_idx": int(m_idx),
+            "gene_human": gh,
+            "gene_mouse": gm,
+            "gene_human_norm": sanitize_symbol(gh),
+            "gene_mouse_norm": sanitize_symbol(gm),
+        })
+    map_df = pd.DataFrame(records).drop_duplicates(subset=["gene_human_norm", "gene_mouse_norm"], keep="first")
+    return map_df
+
+def fisher_meta(pvals):
+    pvals = np.asarray(pvals, dtype=float)
+    eps = 1e-300
+    pvals = np.clip(pvals, eps, 1 - eps)
+    X = -2.0 * np.sum(np.log(pvals))
+    df = 2 * pvals.size
+    p_meta = 1.0 - chi2.cdf(X, df)
+    return X, df, p_meta
+
+def preprocess_species_df(df):
+    df = df.copy()
+    expected_cols = ["gene_id", "overlap_count", "pval", "overlap_genes", "pval_adj"]
+    missing = [c for c in expected_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in species df: {missing}")
+    df["gene_id"] = df["gene_id"].astype(str).str.strip()
+    df["gene_id_norm"] = df["gene_id"].apply(sanitize_symbol)
+    df["pval"] = pd.to_numeric(df["pval"], errors="coerce")
+    df["overlap_count"] = pd.to_numeric(df["overlap_count"], errors="coerce")
+    df["pval_adj"] = pd.to_numeric(df["pval_adj"], errors="coerce")
+    df = df.sort_values("pval", ascending=True).drop_duplicates(subset=["gene_id_norm"], keep="first")
+    return df
+
+def meta_on_ortholog_intersection(human_df, mouse_df, species_config, homology_indices):
+    ortho_map = build_ortholog_map(species_config, homology_indices)
+    human_df = preprocess_species_df(human_df)
+    mouse_df = preprocess_species_df(mouse_df)
+
+    merged = (
+        ortho_map
+        .merge(
+            human_df[["gene_id_norm", "gene_id", "pval", "overlap_count", "pval_adj"]],
+            left_on="gene_human_norm", right_on="gene_id_norm", how="left"
+        )
+        .merge(
+            mouse_df[["gene_id_norm", "gene_id", "pval", "overlap_count", "pval_adj"]],
+            left_on="gene_mouse_norm", right_on="gene_id_norm", how="left",
+            suffixes=("_human", "_mouse")
+        )
+    )
+
+    merged = merged.rename(columns={
+        "gene_id_human": "gene_id_human_df",
+        "gene_id_mouse": "gene_id_mouse_df",
+        "pval_human": "p_human",
+        "pval_mouse": "p_mouse",
+        "overlap_count_human": "overlap_human",
+        "overlap_count_mouse": "overlap_mouse",
+        "pval_adj_human": "q_human",
+        "pval_adj_mouse": "q_mouse",
+    })
+
+    merged["p_human"] = pd.to_numeric(merged["p_human"], errors="coerce")
+    merged["p_mouse"] = pd.to_numeric(merged["p_mouse"], errors="coerce")
+
+    valid = merged["p_human"].notna() & merged["p_mouse"].notna()
+
+    merged["fisher_X"] = np.nan
+    merged["fisher_df"] = np.nan
+    merged["p_meta"] = np.nan
+
+    def fisher_row(r):
+        X, df_, pmeta = fisher_meta([r["p_human"], r["p_mouse"]])
+        return pd.Series({"fisher_X": X, "fisher_df": df_, "p_meta": pmeta})
+
+    res = merged.loc[valid, ["p_human", "p_mouse"]].apply(fisher_row, axis=1)
+    merged.loc[valid, ["fisher_X", "fisher_df", "p_meta"]] = res
+
+    valid_meta = merged["p_meta"].notna()
+    merged["q_meta"] = np.nan
+    if valid_meta.any():
+        merged.loc[valid_meta, "q_meta"] = multipletests(merged.loc[valid_meta, "p_meta"], method="fdr_bh")[1]
+
+    n_total = len(merged)
+    n_human_match = int(merged["p_human"].notna().sum())
+    n_mouse_match = int(merged["p_mouse"].notna().sum())
+    n_meta_pairs = int(valid.sum())
+    print(f"Ortholog pairs total: {n_total}")
+    print(f"Matched with human df: {n_human_match} / {n_total}")
+    print(f"Matched with mouse df: {n_mouse_match} / {n_total}")
+    print(f"Meta-tested pairs (both species have p): {n_meta_pairs} / {n_total}")
+
+    out_cols = [
+        "human_idx", "mouse_idx",
+        "gene_human", "gene_mouse", "gene_human_norm", "gene_mouse_norm",
+        "gene_id_human_df", "gene_id_mouse_df",
+        "p_human", "p_mouse",
+        "overlap_human", "overlap_mouse",
+        "q_human", "q_mouse",
+        "fisher_X", "fisher_df", "p_meta", "q_meta"
+    ]
+    out_cols = [c for c in out_cols if c in merged.columns]
+    return merged[out_cols]
