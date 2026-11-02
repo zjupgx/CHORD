@@ -5,57 +5,467 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
 from collections import Counter, defaultdict, deque
-from functools import lru_cache
+from pathlib import Path
+from typing import Mapping, Sequence
 
-from anndata import AnnData
+from anndata import AnnData, read_h5ad
 
 from matplotlib import cm, colors
-from matplotlib.colors import to_hex
 from matplotlib.lines import Line2D
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
-from scipy.cluster.hierarchy import linkage, dendrogram, to_tree, ClusterNode
+from scipy.cluster.hierarchy import linkage, dendrogram, to_tree
 from scipy.sparse import issparse
-from scipy.spatial.distance import squareform
 
-from sklearn.metrics.pairwise import cosine_distances
-
-# ------------------------------------------------------------------
-# 1. Consensus support
-# ------------------------------------------------------------------
 def reorder_embeddings(emb, row_labels, label2idx):
-    """
-    Reorder embedding rows to match the order of `labels_master`.
+    emb = _dense_float_embedding(emb, source="embedding")
+    row_labels = list(row_labels)
+    if len(row_labels) != emb.shape[0]:
+        raise ValueError(
+            "The number of row labels does not match the number of "
+            f"embedding rows: {len(row_labels)} != {emb.shape[0]}."
+        )
+    if len(set(row_labels)) != len(row_labels):
+        raise ValueError("Embedding row labels must be unique.")
 
-    Args:
-        emb:
-            Embedding matrix whose rows correspond to `row_labels`.
-        row_labels:
-            Row labels for `emb`.
-        label2idx:
-            Mapping from label to target row index.
+    master_items = sorted(label2idx.items(), key=lambda item: item[1])
+    master_labels = [label for label, _ in master_items]
+    expected_indices = list(range(len(master_labels)))
+    if [index for _, index in master_items] != expected_indices:
+        raise ValueError("label2idx values must be consecutive indices from zero.")
 
-    Returns:
-        Reordered embedding matrix.
-    """
-    order = [label2idx[l] for l in row_labels]
+    source_index = {label: index for index, label in enumerate(row_labels)}
+    missing = [label for label in master_labels if label not in source_index]
+    extra = [label for label in row_labels if label not in label2idx]
+    if missing or extra:
+        raise ValueError(
+            "Embedding labels do not match the master labels. "
+            f"Missing={missing}; extra={extra}."
+        )
+
+    order = [source_index[label] for label in master_labels]
     return emb[order]
 
 
+def _dense_float_embedding(embedding, *, source):
+    if issparse(embedding):
+        embedding = embedding.toarray()
+    try:
+        matrix = np.asarray(embedding, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{source} must contain numeric values.") from exc
+    if matrix.ndim != 2:
+        raise ValueError(f"{source} must be two-dimensional, got {matrix.ndim}D.")
+    if not np.isfinite(matrix).all():
+        raise ValueError(f"{source} contains NaN or infinite values.")
+    return matrix
+
+
+def _l2_normalize_embedding_rows(embedding, *, source):
+    matrix = _dense_float_embedding(embedding, source=source)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    zero_rows = np.flatnonzero(norms[:, 0] <= np.finfo(np.float64).eps)
+    if zero_rows.size:
+        raise ValueError(
+            f"{source} contains zero-norm rows at indices "
+            f"{zero_rows.tolist()}."
+        )
+    return matrix / norms
+
+
+def _prepare_normalized_embeddings(
+        embeddings_list,
+        labels_master,
+        row_labels_list=None,
+        row_indices=None,
+    ):
+    embeddings = list(embeddings_list)
+    labels_master = list(labels_master)
+    if not embeddings:
+        raise ValueError("embeddings_list must contain at least one embedding.")
+    if len(labels_master) < 2:
+        raise ValueError("At least two master labels are required to build a tree.")
+    if len(set(labels_master)) != len(labels_master):
+        raise ValueError("labels_master must contain unique labels.")
+
+    if row_labels_list is not None:
+        row_labels_list = list(row_labels_list)
+        if len(row_labels_list) != len(embeddings):
+            raise ValueError(
+                "row_labels_list must have one entry per embedding: "
+                f"{len(row_labels_list)} != {len(embeddings)}."
+            )
+
+    label2idx = {label: index for index, label in enumerate(labels_master)}
+    normalized = []
+    for replicate_index, embedding in enumerate(embeddings):
+        source = f"embedding replicate {replicate_index + 1}"
+        matrix = _dense_float_embedding(embedding, source=source)
+        if row_labels_list is not None:
+            matrix = reorder_embeddings(
+                matrix,
+                row_labels_list[replicate_index],
+                label2idx,
+            )
+        elif matrix.shape[0] != len(labels_master):
+            raise ValueError(
+                f"{source} has {matrix.shape[0]} rows but "
+                f"{len(labels_master)} master labels were provided."
+            )
+        if row_indices is not None:
+            matrix = matrix[row_indices, :]
+        normalized.append(
+            _l2_normalize_embedding_rows(matrix, source=source)
+        )
+    return normalized
+
+
+def _representation_source(adata, representation, *, path):
+    if representation == "X":
+        source = adata.X
+    elif representation.startswith("obsm:"):
+        key = representation.split(":", 1)[1]
+        if not key or key not in adata.obsm:
+            raise KeyError(
+                f"{path} does not contain obsm representation {key!r}."
+            )
+        source = adata.obsm[key]
+    elif representation.startswith("layer:"):
+        key = representation.split(":", 1)[1]
+        if not key or key not in adata.layers:
+            raise KeyError(
+                f"{path} does not contain layer representation {key!r}."
+            )
+        source = adata.layers[key]
+    else:
+        raise ValueError(
+            "representation must be 'X', 'obsm:<key>', or 'layer:<key>'."
+        )
+
+    if len(source.shape) != 2 or source.shape[0] != adata.n_obs:
+        raise ValueError(
+            f"Representation {representation!r} in {path} must have shape "
+            f"(n_obs, n_features); got {source.shape}."
+        )
+    return source
+
+
+def _representation_rows(source, positions, *, source_name):
+    values = _raw_representation_rows(source, positions)
+    return _dense_float_embedding(values, source=source_name)
+
+
+def _raw_representation_rows(source, positions):
+    if hasattr(source, "iloc"):
+        return source.iloc[positions].to_numpy()
+    return source[positions, :]
+
+
+def _normalize_species_map(species_map):
+    if species_map is None:
+        return {}
+    if not isinstance(species_map, Mapping):
+        raise TypeError("species_map must be a mapping of source to target names.")
+
+    normalized = {}
+    for source, target in species_map.items():
+        source = str(source)
+        target = str(target)
+        if not source or not target:
+            raise ValueError("species_map names must be non-empty strings.")
+        normalized[source] = target
+    return normalized
+
+
+def _apply_species_map(obs, *, path, species_key, species_map):
+    if not species_map:
+        return obs
+    if species_key not in obs:
+        raise KeyError(
+            f"{path} is missing species obs column {species_key!r}, which is "
+            "required by species_map."
+        )
+
+    present_species = {
+        str(value) for value in obs[species_key].dropna().unique().tolist()
+    }
+    collisions = [
+        (source, target)
+        for source, target in species_map.items()
+        if source != target and source in present_species and target in present_species
+    ]
+    if collisions:
+        formatted = ", ".join(
+            f"{source!r} -> {target!r}" for source, target in collisions
+        )
+        raise ValueError(
+            f"Species mapping for {path} would merge species that already coexist in "
+            f"{species_key!r}: {formatted}. Rename or filter the inputs explicitly "
+            "before building the tree."
+        )
+
+    mapped_obs = obs.copy()
+    mapped_obs[species_key] = [
+        value
+        if pd.isna(value)
+        else species_map.get(str(value), str(value))
+        for value in obs[species_key]
+    ]
+    return mapped_obs
+
+
+def _observation_labels(
+        obs,
+        positions,
+        *,
+        path,
+        label_key,
+        group_keys,
+        label_separator,
+        original_obs=None,
+        species_key="species",
+        species_map=None,
+    ):
+    selected_obs = obs.iloc[positions]
+    if group_keys:
+        missing = [key for key in group_keys if key not in selected_obs]
+        if missing:
+            raise KeyError(f"{path} is missing group obs columns: {missing}.")
+        if selected_obs[list(group_keys)].isna().to_numpy().any():
+            raise ValueError(
+                f"{path} contains missing values in group columns "
+                f"{list(group_keys)}."
+            )
+        group_values = [
+            tuple(map(str, values))
+            for values in selected_obs[list(group_keys)].itertuples(
+                index=False, name=None
+            )
+        ]
+        labels = [label_separator.join(values) for values in group_values]
+        label_to_group = {}
+        for label, group_value in zip(labels, group_values):
+            previous = label_to_group.setdefault(label, group_value)
+            if previous != group_value:
+                raise ValueError(
+                    f"Joining group columns with {label_separator!r} creates "
+                    f"the ambiguous label {label!r} in {path}."
+                )
+        return labels, group_values
+
+    if label_key not in selected_obs:
+        raise KeyError(f"{path} is missing label obs column {label_key!r}.")
+    if selected_obs[label_key].isna().any():
+        raise ValueError(f"{path} contains missing values in {label_key!r}.")
+    labels = selected_obs[label_key].astype(str).tolist()
+
+    if species_map:
+        original_selected = original_obs.iloc[positions]
+        original_species = original_selected[species_key].astype(str).tolist()
+        mapped_species = selected_obs[species_key].astype(str).tolist()
+        remapped_labels = []
+        for label, source_species, target_species in zip(
+                labels, original_species, mapped_species
+            ):
+            if source_species == target_species:
+                remapped_labels.append(label)
+                continue
+            prefix = f"{source_species}{label_separator}"
+            if label == source_species:
+                remapped_labels.append(target_species)
+            elif label.startswith(prefix):
+                remapped_labels.append(
+                    f"{target_species}{label_separator}{label[len(prefix):]}"
+                )
+            else:
+                raise ValueError(
+                    f"Cannot apply species mapping {source_species!r} -> "
+                    f"{target_species!r} to label {label!r} in {path}. Use "
+                    "group_keys containing the species column, or labels of "
+                    "the form 'species<separator>value'."
+                )
+        labels = remapped_labels
+    return labels, labels
+
+
+def _mean_rows_by_group(
+        representation_source,
+        positions,
+        labels,
+        group_values,
+        *,
+        source_name,
+    ):
+    group_to_positions = {}
+    group_to_label = {}
+    group_order = []
+    for position, label, group_value in zip(positions, labels, group_values):
+        if group_value not in group_to_positions:
+            group_order.append(group_value)
+            group_to_positions[group_value] = []
+            group_to_label[group_value] = label
+        group_to_positions[group_value].append(int(position))
+
+    averaged_rows = []
+    averaged_labels = []
+    for group_value in group_order:
+        group_positions = np.asarray(group_to_positions[group_value], dtype=int)
+        group_matrix = _raw_representation_rows(
+            representation_source, group_positions
+        )
+        if issparse(group_matrix):
+            group_mean = np.asarray(group_matrix.mean(axis=0)).reshape(-1)
+        else:
+            dense_group = _dense_float_embedding(
+                group_matrix, source=source_name
+            )
+            group_mean = dense_group.mean(axis=0)
+        if not np.isfinite(group_mean).all():
+            raise ValueError(f"{source_name} produces a non-finite group mean.")
+        averaged_rows.append(group_mean)
+        averaged_labels.append(group_to_label[group_value])
+    return np.vstack(averaged_rows), averaged_labels
+
+
+def load_label_embeddings_from_h5ads(
+        h5ad_paths: Sequence[str | Path],
+        *,
+        representation: str = "X",
+        aggregation: str = "none",
+        label_key: str = "label_str",
+        group_keys: Sequence[str] | None = None,
+        filter_key: str | None = None,
+        filter_value: str | None = None,
+        label_separator: str = "_",
+        species_key: str = "species",
+        species_map: Mapping[str, str] | None = None,
+    ):
+    paths = [Path(path) for path in h5ad_paths]
+    if not paths:
+        raise ValueError("At least one h5ad path is required.")
+    if len(set(paths)) != len(paths):
+        raise ValueError("h5ad paths must be unique.")
+    if aggregation not in {"none", "mean"}:
+        raise ValueError("aggregation must be 'none' or 'mean'.")
+    if (filter_key is None) != (filter_value is None):
+        raise ValueError("filter_key and filter_value must be provided together.")
+    if not isinstance(species_key, str) or not species_key:
+        raise ValueError("species_key must be a non-empty string.")
+    species_map = _normalize_species_map(species_map)
+    if group_keys is not None:
+        if isinstance(group_keys, str):
+            group_keys = (group_keys,)
+        group_keys = tuple(group_keys)
+        if not group_keys:
+            group_keys = None
+        elif len(set(group_keys)) != len(group_keys):
+            raise ValueError("group_keys must be unique.")
+
+    embeddings_list = []
+    row_labels_list = []
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"Embedding h5ad file not found: {path}")
+        adata = read_h5ad(path, backed="r")
+        try:
+            mapped_obs = _apply_species_map(
+                adata.obs,
+                path=path,
+                species_key=species_key,
+                species_map=species_map,
+            )
+            if filter_key is None:
+                mask = np.ones(adata.n_obs, dtype=bool)
+            else:
+                if filter_key not in mapped_obs:
+                    raise KeyError(
+                        f"{path} is missing filter obs column {filter_key!r}."
+                    )
+                filter_values = mapped_obs[filter_key].astype(str).to_numpy()
+                mask = filter_values == str(filter_value)
+            positions = np.flatnonzero(mask)
+            if positions.size < 2:
+                raise ValueError(
+                    f"{path} contains fewer than two selected observations."
+                )
+
+            labels, group_values = _observation_labels(
+                mapped_obs,
+                positions,
+                path=path,
+                label_key=label_key,
+                group_keys=group_keys,
+                label_separator=label_separator,
+                original_obs=adata.obs,
+                species_key=species_key,
+                species_map=species_map,
+            )
+            source = _representation_source(
+                adata, representation, path=path
+            )
+            source_name = f"{path}:{representation}"
+            if aggregation == "mean":
+                embedding, labels = _mean_rows_by_group(
+                    source,
+                    positions,
+                    labels,
+                    group_values,
+                    source_name=source_name,
+                )
+            else:
+                embedding = _representation_rows(
+                    source,
+                    positions,
+                    source_name=source_name,
+                )
+
+            if len(labels) < 2:
+                raise ValueError(
+                    f"{path} produces fewer than two label vectors."
+                )
+            if len(set(labels)) != len(labels):
+                duplicates = sorted(
+                    label for label, count in Counter(labels).items() if count > 1
+                )
+                raise ValueError(
+                    f"{path} produces duplicate labels: {duplicates}. Use "
+                    "aggregation='mean' or provide more specific group keys."
+                )
+            embeddings_list.append(embedding)
+            row_labels_list.append(labels)
+        finally:
+            adata.file.close()
+
+    labels_master = list(row_labels_list[0])
+    label2idx = {label: index for index, label in enumerate(labels_master)}
+    for embedding, labels in zip(embeddings_list, row_labels_list):
+        reorder_embeddings(embedding, labels, label2idx)
+
+    return embeddings_list, labels_master, row_labels_list
+
+
+def load_celltype_embeddings_from_h5ads(
+        h5ad_paths: Sequence[str | Path],
+        *,
+        item_type_key: str = "item_type",
+        celltype_value: str = "celltype",
+        label_key: str = "label_str",
+        species_key: str = "species",
+        species_map: Mapping[str, str] | None = None,
+    ):
+    return load_label_embeddings_from_h5ads(
+        h5ad_paths,
+        representation="X",
+        aggregation="none",
+        label_key=label_key,
+        filter_key=item_type_key,
+        filter_value=celltype_value,
+        species_key=species_key,
+        species_map=species_map,
+    )
+
+
 def extract_clusters_by_label(Z, labels_master):
-    """
-    Extract all non-root internal clusters from a linkage tree as label sets.
-
-    Args:
-        Z:
-            Linkage matrix.
-        labels_master:
-            Master list of leaf labels.
-
-    Returns:
-        Set of frozensets, where each frozenset contains the leaf labels
-        under one internal node, excluding the full root cluster.
-    """
     n = len(labels_master)
     root, nodes = to_tree(Z, rd=True)
     return {
@@ -65,13 +475,6 @@ def extract_clusters_by_label(Z, labels_master):
 
 
 def _similarity(set1, set2, metric="f1"):
-    """
-    Compute set similarity between two clusters.
-
-    Supported metrics:
-    - "jaccard": intersection / union
-    - "f1": Dice/F1 overlap = 2 * intersection / (size1 + size2)
-    """
     inter = len(set1 & set2)
     if metric == "jaccard":
         return inter / (len(set1 | set2))
@@ -81,71 +484,39 @@ def _similarity(set1, set2, metric="f1"):
         raise ValueError("metric must be 'jaccard' or 'f1'")
 
 
-# -------------------------------------------------------------
-# Fuzzy consensus support with a similarity threshold
-# -------------------------------------------------------------
 def consensus_support_fuzzy_threshold(embeddings_list,
                                       labels_master,
                                       row_labels_list=None,
                                       method="ward",
                                       metric="f1",
                                       min_sim=0.8):
-    """
-    Compute a consensus dendrogram and fuzzy support scores.
+    labels_master = list(labels_master)
+    if not 0.0 <= float(min_sim) <= 1.0:
+        raise ValueError("min_sim must be between 0 and 1.")
+    normalized_embeddings = _prepare_normalized_embeddings(
+        embeddings_list,
+        labels_master,
+        row_labels_list=row_labels_list,
+    )
+    R = len(normalized_embeddings)
+    cluster_sets = []
 
-    For each cluster in the main consensus tree, the function finds the most
-    similar cluster in each replicate tree. A replicate contributes only if
-    the best similarity is at least `min_sim`; otherwise it contributes 0.
-
-    Args:
-        embeddings_list:
-            List of embedding matrices, one per replicate.
-        labels_master:
-            Master list of labels defining the target row order.
-        row_labels_list:
-            Optional list of row-label lists for each replicate embedding.
-            If provided, each embedding is reordered to match `labels_master`.
-        method:
-            Linkage method.
-        metric:
-            Similarity metric used between clusters ("jaccard" or "f1").
-        min_sim:
-            Minimum cluster similarity required for a replicate to contribute.
-
-    Returns:
-        Z_main:
-            Linkage matrix of the consensus tree.
-        support:
-            Dictionary mapping cluster leaf sets to support values in [0, 100].
-    """
-    R = len(embeddings_list)
-    label2idx = {lab: i for i, lab in enumerate(labels_master)}
-    D_sum, cluster_sets = None, []
-
-    # --------- Process each replicate tree ---------
-    for r, emb in enumerate(embeddings_list):
-        if row_labels_list is not None:
-            emb = reorder_embeddings(emb, row_labels_list[r], label2idx)
-
-        euc = np.sqrt(2 * cosine_distances(emb))
-        D_sum = euc if D_sum is None else D_sum + euc
-
-        Z_i = linkage(squareform(euc, checks=False), method=method)
-        # Keep all internal clusters plus the full root cluster
+    for embedding in normalized_embeddings:
+        Z_i = linkage(embedding, method=method, metric="euclidean")
         cluster_sets.append(
             extract_clusters_by_label(Z_i, labels_master) |
             {frozenset(labels_master)}
         )
 
-    # --------- Main consensus tree ---------
-    D_avg = D_sum / R
-    Z_main = linkage(squareform(D_avg, checks=False), method=method)
+    joint_embedding = (
+        np.concatenate(normalized_embeddings, axis=1) / np.sqrt(float(R))
+    )
+    Z_main = linkage(joint_embedding, method=method, metric="euclidean")
     all_clusters = (
         extract_clusters_by_label(Z_main, labels_master) |
         {frozenset(labels_master)}
     )
 
-    # --------- Fuzzy support ---------
     support = {}
     for C in all_clusters:
         sim_sum = 0.0
@@ -158,46 +529,6 @@ def consensus_support_fuzzy_threshold(embeddings_list,
     return Z_main, support
 
 
-# ------------------------------------------------------------------
-# 2. Visualization helpers
-# ------------------------------------------------------------------
-def _leaf_x_positions(den):
-    """
-    Build a mapping from leaf id to x coordinate based on a dendrogram
-    generated with `no_plot=True`.
-
-    SciPy places the i-th leaf at x = 5 + 10 * i by default.
-    """
-    leaves = den['leaves']
-    return {leaf_id: 5 + 10 * i for i, leaf_id in enumerate(leaves)}
-
-
-def _annotate_support(ax,
-                      node: ClusterNode,
-                      labels_master,
-                      leaf_xpos: dict,
-                      support: dict,
-                      fontsize=7):
-    """
-    Recursively annotate support values for all internal nodes.
-    """
-    if node.is_leaf():
-        return
-    leaves = frozenset(labels_master[j] for j in node.pre_order())
-    supp = support.get(leaves, 0)
-
-    # Place the text at the center of the node's horizontal branch
-    xs = [leaf_xpos[leaf] for leaf in node.pre_order()]
-    x = np.mean(xs)
-    y = node.dist
-    ax.text(x, y, f"{supp:.0f}%", ha='center', va='bottom',
-            fontsize=fontsize, color='black')
-    _annotate_support(ax, node.left, labels_master, leaf_xpos, support, fontsize)
-    _annotate_support(ax, node.right, labels_master, leaf_xpos, support, fontsize)
-
-
-
-# Shared dendrogram renderer
 def _render_dendrogram_core(
         Z_main, support, labels_master,
         link_color_func,
@@ -212,24 +543,6 @@ def _render_dendrogram_core(
         set_arial=False,
         legend_cfg=None,
     ):
-    """
-    Render a dendrogram with externally supplied branch colors.
-
-    Args:
-        Z_main:
-            Linkage matrix.
-        support:
-            Support dictionary, not always directly used here but kept to
-            preserve a consistent interface with wrapper functions.
-        labels_master:
-            Master leaf labels.
-        link_color_func:
-            Function mapping a leaf-set frozenset to a branch color.
-        species_color:
-            Optional species-to-color mapping for leaf labels.
-        legend_cfg:
-            Optional config dict for a discrete legend.
-    """
     if set_arial:
         mpl.rcParams['pdf.fonttype'] = 42
         mpl.rcParams['ps.fonttype'] = 42
@@ -335,7 +648,6 @@ def _render_dendrogram_core(
     return fig, ax
 
 
-# Version A: branch color = consensus support
 def plot_dendrogram_support_colors(
         Z_main, support, labels_master,
         species_color=None,
@@ -348,9 +660,6 @@ def plot_dendrogram_support_colors(
         x_major_step=None,
         set_arial=False
     ):
-    """
-    Plot a dendrogram whose branch colors encode consensus support.
-    """
     strong, mid, weak = "#941514", "#E3AEAA", "#C8C8C8"
 
     def _link_color_by_support(leaves_set):
@@ -364,10 +673,10 @@ def plot_dendrogram_support_colors(
 
     legend_cfg = {
         "colors": [strong, mid, weak],
-        "labels": [rf"$\geq$ {color_thr[0]} %",
-                   rf"{color_thr[1]}–{color_thr[0]-1} %",
-                   rf"$<$ {color_thr[1]} %"],
-        "title": "Consensus support",
+        "labels": [f"[{color_thr[0]:g}, 100]",
+                   f"[{color_thr[1]:g}, {color_thr[0]:g})",
+                   f"[0, {color_thr[1]:g})"],
+        "title": "Support (%)",
         "loc": "lower left" if (orientation in ("right", "left") and flip_lr) else "lower right"
     }
 
@@ -383,30 +692,7 @@ def plot_dendrogram_support_colors(
     )
 
 
-# Version B: branch color = homolog-count bins
 def resolve_species_gene(homology_files, species_all_adatas, query_species, query_gene):
-    """
-    Resolve homologous genes across species by on-demand multi-hop traversal.
-
-    Starting from (`query_species`, `query_gene`), this function loads only
-    homology CSV files relevant to the currently visited species, performs a
-    BFS-style traversal across species, and finally matches candidate genes
-    against each species AnnData `var_names`.
-
-    Args:
-        homology_files:
-            Dictionary mapping species pairs to CSV paths.
-        species_all_adatas:
-            Dictionary mapping species name to (AnnData, cell-type-column).
-        query_species:
-            Species of the query gene.
-        query_gene:
-            Query gene name.
-
-    Returns:
-        Dictionary:
-            {species_name: gene_index_or_None}
-    """
     csv_cache = {}
 
     def get_df(pair):
@@ -428,7 +714,6 @@ def resolve_species_gene(homology_files, species_all_adatas, query_species, quer
     while q:
         cur_sp, cur_gene = q.popleft()
 
-        # Traverse every homology table that contains the current species
         for (a, b) in pairs:
             if cur_sp != a and cur_sp != b:
                 continue
@@ -437,7 +722,6 @@ def resolve_species_gene(homology_files, species_all_adatas, query_species, quer
             if df is None:
                 continue
 
-            # Case 1: current species is on the left side
             if cur_sp == a:
                 col_cur = f"{a}_gene"
                 col_other = f"{b}_gene"
@@ -451,7 +735,6 @@ def resolve_species_gene(homology_files, species_all_adatas, query_species, quer
                             found[b].add(pg)
                             q.append(node)
 
-            # Case 2: current species is on the right side
             if cur_sp == b:
                 col_cur = f"{b}_gene"
                 col_other = f"{a}_gene"
@@ -489,27 +772,8 @@ def build_label2expr_OG_adata(
         species_gene: dict[str, int],
         layer=None,
 ):
-    """
-    Build a mapping:
-        {leaf_label -> average expression of the orthologous gene}
-
-    Args:
-        labels_master:
-            Leaf labels of the form "species_celltype".
-        species_adata:
-            Mapping from species name to (AnnData, cell-type-column-name).
-        species_gene:
-            Mapping from species name to gene index or gene name.
-        layer:
-            Optional AnnData layer to use instead of `.X`.
-
-    Returns:
-        Dictionary mapping each leaf label to the corresponding
-        cell-type mean expression value.
-    """
     label2expr = {}
 
-    # 1) Pre-aggregate expression by species and cell type
     species_cache = defaultdict(dict)
     for sp, ad in species_adata.items():
         celltype_key = ad[1]
@@ -539,7 +803,6 @@ def build_label2expr_OG_adata(
         )
         species_cache[sp] = df_tmp
 
-    # 2) Read out one value per leaf label
     for lab in labels_master:
         sp, ctype = lab.split("_", 1)
 
@@ -552,13 +815,6 @@ def build_label2expr_OG_adata(
 
 
 def _compute_expr_and_delta(root, labels_master, label2expr):
-    """
-    Compute per-node mean expression and child-minus-parent deltas.
-
-    This follows the current implementation exactly:
-    - post-order traversal computes node-level mean expression and leaf count
-    - pre-order traversal computes `delta = child.expr - parent.expr`
-    """
     def post(nd):
         if nd.is_leaf():
             nd.expr = label2expr[labels_master[nd.id]]
@@ -595,20 +851,10 @@ def plot_tree_drift_fullcolor(
     tick_labelsize=None,
     cbar_corner="auto",
     cbar_size=("2%", "10%"),
-    cbar_pad=0.01
+    cbar_pad=0.01,
+    orientation="right",
 ):
-    """
-    Plot a dendrogram in which all branch segments are colored by
-    expression drift:
-        Δe = child expression - parent expression
 
-    Notes:
-        - The base dendrogram is first drawn in gray, then recolored by Δe.
-    """
-
-    # --------------------------
-    # 0) Font defaults
-    # --------------------------
     if set_arial:
         mpl.rcParams['pdf.fonttype'] = 42
         mpl.rcParams['ps.fonttype'] = 42
@@ -620,25 +866,21 @@ def plot_tree_drift_fullcolor(
     if tick_labelsize is None:
         tick_labelsize = 8
 
-    # --------------------------
-    # 1) Tree and Δe values
-    # --------------------------
     root, nodes = to_tree(Z_main, rd=True)
     _compute_expr_and_delta(root, labels_master, label2expr)
 
     abs_deltas = [abs(n.delta) for n in nodes if n.delta is not None]
     if vmax is None:
         vmax = np.percentile(abs_deltas, 95) if abs_deltas else 1e-2
+        if vmax <= 0:
+            vmax = max(abs_deltas, default=0.0) or 1e-2
     norm = colors.TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
-    cmap = cm.get_cmap(cmap_name)
+    cmap = mpl.colormaps[cmap_name]
 
-    # --------------------------
-    # 2) Background dendrogram in gray
-    # --------------------------
     fig, ax = plt.subplots(figsize=size)
     den = dendrogram(
         Z_main,
-        orientation="right",
+        orientation=orientation,
         leaf_label_func=lambda i: labels_master[i],
         link_color_func=lambda _: "#888888",
         above_threshold_color="#888888",
@@ -654,18 +896,19 @@ def plot_tree_drift_fullcolor(
             pass
 
     species_list = sorted({lab.split('_', 1)[0] for lab in labels_master})
-    palette = cm.get_cmap('tab10').colors
+    palette = mpl.colormaps['tab10'].colors
     species2color = {sp: palette[i % len(palette)]
                      for i, sp in enumerate(species_list)}
 
     fig.canvas.draw()
-    for t in ax.get_yticklabels():
+    leaf_ticklabels = (
+        ax.get_yticklabels() if orientation in ("left", "right")
+        else ax.get_xticklabels()
+    )
+    for t in leaf_ticklabels:
         sp = t.get_text().split('_', 1)[0]
         t.set_color(species2color.get(sp, "black"))
 
-    # --------------------------
-    # 3) Recompute node coordinates
-    # --------------------------
     y_leaf = {leaf_id: 5 + 10 * idx for idx, leaf_id in enumerate(den["leaves"])}
 
     def assign_coords(nd):
@@ -679,9 +922,6 @@ def plot_tree_drift_fullcolor(
             nd.y = (nd.left.y + nd.right.y) / 2.0
     assign_coords(root)
 
-    # --------------------------
-    # 4) Overlay Δe-colored branches
-    # --------------------------
     def safe_color(delta):
         return cmap(norm(delta)) if delta is not None and not np.isnan(delta) \
                else (0.8, 0.8, 0.8, 1.0)
@@ -689,39 +929,46 @@ def plot_tree_drift_fullcolor(
     for nd in nodes:
         if nd.is_leaf():
             continue
-        ch = nd.left
-        ax.hlines(ch.y, ch.x, nd.x, color=safe_color(ch.delta), linewidth=lw_h, zorder=3)
-        ch = nd.right
-        ax.hlines(ch.y, ch.x, nd.x, color=safe_color(ch.delta), linewidth=lw_h, zorder=3)
+        for child in (nd.left, nd.right):
+            if orientation in ("left", "right"):
+                ax.hlines(child.y, child.x, nd.x,
+                          color=safe_color(child.delta), linewidth=lw_h, zorder=3)
+                ax.vlines(nd.x, min(child.y, nd.y), max(child.y, nd.y),
+                          color=safe_color(child.delta), linewidth=lw_v, zorder=3)
+            else:
+                ax.vlines(child.y, child.x, nd.x,
+                          color=safe_color(child.delta), linewidth=lw_v, zorder=3)
+                ax.hlines(nd.x, min(child.y, nd.y), max(child.y, nd.y),
+                          color=safe_color(child.delta), linewidth=lw_h, zorder=3)
 
-        y_low, y_mid, y_high = nd.left.y, nd.y, nd.right.y
-        ax.vlines(nd.x, y_low, y_mid, color=safe_color(nd.left.delta), linewidth=lw_v, zorder=3)
-        ax.vlines(nd.x, y_mid, y_high, color=safe_color(nd.right.delta), linewidth=lw_v, zorder=3)
-
-    # --------------------------
-    # 5) Axis formatting
-    # --------------------------
-    ax.yaxis.set_label_position('right')
-    ax.yaxis.set_ticks_position('none')
-    ax.tick_params(axis='y', which='both',
-                   left=False, right=False, length=0, width=0,
-                   labelleft=False, labelright=True, labelsize=tick_labelsize, pad=4)
-    ax.tick_params(axis='x', which='both', labelsize=tick_labelsize, pad=2, width=0.3)
     ax.set_title("Orthologous gene drift", fontsize=axis_labelsize)
-    ax.set_xlabel("Ward distance", fontsize=axis_labelsize)
+    if orientation in ("left", "right"):
+        ax.yaxis.set_label_position('right')
+        ax.yaxis.set_ticks_position('none')
+        ax.tick_params(axis='y', which='both',
+                       left=False, right=False, length=0, width=0,
+                       labelleft=False, labelright=True, labelsize=tick_labelsize, pad=4)
+        ax.tick_params(axis='x', which='both', labelsize=tick_labelsize, pad=2, width=0.3)
+        ax.set_xlabel("Ward distance", fontsize=axis_labelsize)
+    else:
+        ax.set_ylabel("Ward distance", fontsize=axis_labelsize)
+        ax.tick_params(axis='x', which='both', labelsize=tick_labelsize, length=0)
+        ax.tick_params(axis='y', which='both', labelsize=tick_labelsize, width=0.3)
     fig.canvas.draw()
-    for t in ax.get_yticklabels():
+    leaf_ticklabels = (
+        ax.get_yticklabels() if orientation in ("left", "right")
+        else ax.get_xticklabels()
+    )
+    for t in leaf_ticklabels:
         sp = t.get_text().split('_', 1)[0]
         t.set_color(species2color.get(sp, "black"))
-        t.set_ha('left')
+        if orientation in ("left", "right"):
+            t.set_ha('left')
 
-    if flip_lr:
+    if flip_lr and orientation in ("left", "right"):
         x0, x1 = ax.get_xlim()
         ax.set_xlim(x1, x0)
 
-    # --------------------------
-    # 6) Corner colorbar
-    # --------------------------
     if cbar_corner == "auto":
         corner = "lower left" if flip_lr else "lower right"
     else:
@@ -746,8 +993,11 @@ def plot_tree_drift_fullcolor(
     else:
         tx_x, ha = 0.98 - cbar_pad, 'right'
 
-    ax.yaxis.set_label_coords(0.985, 0.5, transform=ax.transAxes)
-    ax.tick_params(axis='x', width=0.6, length=2)
+    if orientation in ("left", "right"):
+        ax.yaxis.set_label_coords(0.985, 0.5, transform=ax.transAxes)
+        ax.tick_params(axis='x', width=0.6, length=2)
+    else:
+        ax.tick_params(axis='y', width=0.6, length=2)
 
     for side in ('right', 'top', 'left', 'bottom'):
         ax.spines[side].set_linewidth(0.6)

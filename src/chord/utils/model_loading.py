@@ -6,6 +6,12 @@ from typing import Any
 import torch
 
 from ..models import CrossSpeciesPrototypeModel
+from ..data.holdout import get_cell_type_holdout_config, build_cell_type_holdout_views
+from ..data.interventions import (
+    intervention_enabled,
+    get_intervention_block,
+    prepare_species_views,
+)
 from ..preprocessing import (
     data_preprocess,
     prepare_multispecies_data,
@@ -34,15 +40,11 @@ def resolve_device(device_str: str) -> torch.device:
     return torch.device(device_str)
 
 
-def build_species_adatas(cfg: dict[str, Any]) -> dict[str, tuple[Any, str]]:
-    """
-    Rebuild species_adatas in the same way as training.
-
-    Returns
-    -------
-    dict
-        {species_name: (adata, label_col)}
-    """
+def build_species_adatas(
+    cfg: dict[str, Any],
+    *,
+    select_hvg: bool = True,
+) -> dict[str, tuple[Any, str]]:
     species_adatas: dict[str, tuple[Any, str]] = {}
 
     n_HVG = cfg["data"].get("n_HVG", 2000)
@@ -59,6 +61,7 @@ def build_species_adatas(cfg: dict[str, Any]) -> dict[str, tuple[Any, str]]:
             n_top_genes=n_HVG,
             cpm=cpm,
             is_preprocessed=is_preprocessed,
+            select_hvg=select_hvg,
         )
         species_adatas[species_name] = (adata, label_col)
 
@@ -66,10 +69,6 @@ def build_species_adatas(cfg: dict[str, Any]) -> dict[str, tuple[Any, str]]:
 
 
 def build_homology_files(cfg: dict[str, Any]) -> dict[tuple[str, str], str]:
-    """
-    Build homology file mapping:
-    {(species1, species2): homology_path}
-    """
     homology_files: dict[tuple[str, str], str] = {}
 
     for item in cfg["data"]["homology"]:
@@ -86,53 +85,44 @@ def load_chord_model_and_homology(
     model_path: str | Path,
     device: str | None = None,
 ):
-    """
-    Rebuild CHORD model from config and load trained weights.
-    Also rebuild homology_indices.
-
-    Parameters
-    ----------
-    cfg
-        Parsed YAML config.
-    model_path
-        Path to the saved model weights, e.g. outdir/best_model.pth
-    device
-        "cpu", "cuda", "auto", or None.
-        If None, use cfg["training"]["device"].
-
-    Returns
-    -------
-    model : CrossSpeciesPrototypeModel
-    homology_indices : Any
-    species_config : dict
-    species_data : Any
-    species_expr_avg : Any
-    global_cell_types : Any
-    """
     model_path = Path(model_path)
 
     if device is None:
         device = cfg["training"]["device"]
     device = resolve_device(device)
 
-    # 1. Rebuild species inputs
-    species_adatas = build_species_adatas(cfg)
+    label_perturbation_enabled = intervention_enabled(
+        cfg, "label_perturbation"
+    )
+    if get_cell_type_holdout_config(cfg) is not None:
+        _full_species_adatas, species_adatas, _metadata = build_cell_type_holdout_views(cfg)
+    else:
+        species_adatas = build_species_adatas(
+            cfg,
+            select_hvg=cfg["data"].get("select_hvg", True),
+        )
+    if label_perturbation_enabled:
+        _full_species_adatas, species_adatas, _metadata = prepare_species_views(
+            species_adatas,
+            label_perturbation_config=(
+                get_intervention_block(cfg, "label_perturbation")
+                if label_perturbation_enabled
+                else None
+            ),
+            default_seed=cfg["training"].get("seed", 42),
+        )
 
-    # 2. Rebuild homology file mapping
     homology_files = build_homology_files(cfg)
 
-    # 3. Rebuild multi-species data and species_config
     species_data, species_config, species_expr_avg, global_cell_types = (
         prepare_multispecies_data(species_adatas)
     )
 
-    # 4. Rebuild homology indices
     homology_indices = get_homology_indices(
         species_config,
         homology_files,
     )
 
-    # 5. Rebuild model structure
     model = CrossSpeciesPrototypeModel(
         species_config,
         cfg["model"]["embed_dim"],
@@ -140,7 +130,6 @@ def load_chord_model_and_homology(
         cfg["model"]["embed_dim"],
     ).to(device)
 
-    # 6. Load trained weights
     state_dict = torch.load(model_path, map_location=device)
     model.load_state_dict(state_dict)
     model.eval()

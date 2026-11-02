@@ -1,7 +1,5 @@
 import matplotlib.pyplot as plt
-import scanpy as sc
 import numpy as np
-from matplotlib.collections import PathCollection
 
 def pretty_boxplot(ax, data, labels, title, pval, *,
                    colors=('tab:blue', 'tab:orange'),
@@ -45,9 +43,10 @@ def pretty_boxplot(ax, data, labels, title, pval, *,
     ax.grid(False)
 
     ax.set_title(f"{title}", pad=8, fontweight='normal',  fontsize=12)
-    ax.text(0.5, 0.95, f"p = {pval:.1e}",
-            transform=ax.transAxes, ha='center', va='bottom',
-            fontsize=10, fontweight='normal')
+    if pval is not None:
+        ax.text(0.5, 0.95, f"p = {pval:.1e}",
+                transform=ax.transAxes, ha='center', va='bottom',
+                fontsize=10, fontweight='normal')
     ax.set_ylim(*ylim)
 
 
@@ -60,7 +59,8 @@ def plot_enrichment_barchart(
     go_id_col: str = 'Term',
     title: str = 'Top Enriched GO Terms',
     color: str = "#97BEE9", 
-    output_file: str = None
+    output_file: str = None,
+    show: bool = True,
     ):
     import numpy as np
     import matplotlib as mpl
@@ -86,16 +86,24 @@ def plot_enrichment_barchart(
         s = str(name)
         return (s[:maxlen] + '...') if len(s) > maxlen else s
     if go_id_col in d_plot.columns:
-        y_labels = [
-            f"{_truncate(name)} ({go_id})"
-            for name, go_id in zip(d_plot[term_col], d_plot[go_id_col])
-        ]
+        import re
+        y_labels = []
+        for name, term in zip(d_plot[term_col], d_plot[go_id_col]):
+            text, raw_term = str(name), str(term)
+            match = re.search(r"GO:\d{7}", raw_term) or re.search(r"GO:\d{7}", text)
+            go_id = match.group() if match else ""
+            text = re.sub(r"GO:\d{7}", "", text).strip(" \t|:;()[]-_")
+            if text.lower() in {"", "na", "nan", "none", "<na>"}:
+                text = re.sub(r"GO:\d{7}", "", raw_term).strip(" \t|:;()[]-_")
+            y_labels.append(f"{_truncate(text)} ({go_id})" if text and go_id
+                            else _truncate(text) if text else go_id or raw_term)
     else:
         y_labels = [_truncate(name) for name in d_plot[term_col]]
     
     fig, ax = plt.subplots(figsize=(6, 4))
+    d_plot['_plot_row'] = np.arange(len(d_plot)).astype(str)
     barplot = sns.barplot(
-        x='-log10(AdjP)', y=term_col, data=d_plot, ax=ax,
+        x='-log10(AdjP)', y='_plot_row', order=d_plot['_plot_row'].tolist(), data=d_plot, ax=ax,
         color=color, edgecolor='white',
         width=0.9
     )
@@ -119,4 +127,6 @@ def plot_enrichment_barchart(
     if output_file:
         plt.savefig(output_file, dpi=300, bbox_inches='tight')
         print(f"Saved: {output_file}")
-    plt.show()
+    if show:
+        plt.show()
+    return fig, ax

@@ -12,7 +12,6 @@ from statsmodels.stats.multitest import multipletests
 
 
 def get_full_ppi(gene, species=9606, score_threshold=400):
-    """Fetch the full STRING PPI network for one gene."""
     string_api_url = "https://string-db.org/api/tsv/network"
     params = {
         "identifiers": gene,
@@ -25,22 +24,12 @@ def get_full_ppi(gene, species=9606, score_threshold=400):
 
 
 def visualize_ppi_with_embedding_filtered(adata_gene, target_gene, species="human", top_n=30, score_threshold=400):
-    """
-    Overlay embedding top-N neighbors on the real PPI network.
-
-    Red: target gene
-    Gold: overlap between embedding top-N and PPI
-    Gray: PPI-only genes not present in the embedding space
-    """
     
-    # 1. Fetch PPI
     species_id = 9606 if species == "human" else 10090
     df_ppi = get_full_ppi(target_gene, species=species_id, score_threshold=score_threshold)
     
-    # 2. Get genes in the embedding space
     embedding_genes = set(adata_gene[adata_gene.obs['species'] == species].obs['gene_id'])
     
-    # 3. Get top-N embedding neighbors
     species_df = adata_gene[adata_gene.obs['species'] == species]
     gene_ids = species_df.obs['gene_id'].tolist()
     gene_matrix = species_df.X
@@ -50,23 +39,19 @@ def visualize_ppi_with_embedding_filtered(adata_gene, target_gene, species="huma
     top_idx = sim.argsort()[::-1][1:top_n + 1]
     top_genes = set([gene_ids[i] for i in top_idx])
     
-    # 4. Define node groups
     all_ppi_genes = set(df_ppi['preferredName_A']).union(df_ppi['preferredName_B'])
     all_ppi_genes.discard(target_gene)
     
     overlap_genes = top_genes & all_ppi_genes
     gray_genes = all_ppi_genes - embedding_genes
     
-    # 5. Filter PPI edges
     df_ppi_filtered = df_ppi[
         df_ppi['preferredName_A'].isin(all_ppi_genes.union({target_gene})) &
         df_ppi['preferredName_B'].isin(all_ppi_genes.union({target_gene}))
     ]
     
-    # 6. Build graph
     G = nx.from_pandas_edgelist(df_ppi_filtered, 'preferredName_A', 'preferredName_B', edge_attr='score')
     
-    # 7. Set node colors
     color_map = []
     for node in G.nodes():
         if node == target_gene:
@@ -78,7 +63,6 @@ def visualize_ppi_with_embedding_filtered(adata_gene, target_gene, species="huma
         else:
             color_map.append('#79BB4C')
     
-    # 8. Plot
     plt.figure(figsize=(5, 5))
     plt.rcParams['font.family'] = 'Arial'
     pos = nx.spring_layout(G, seed=42)
@@ -91,9 +75,6 @@ def visualize_ppi_with_embedding_filtered(adata_gene, target_gene, species="huma
 
 
 def get_ppi_neighbors(protein, species, score_threshold=700, delay=1.0):
-    """
-    Fetch STRING PPI neighbors for one gene with a delay.
-    """
     string_api_url = "https://string-db.org/api/tsv/network"
     params = {
         "identifiers": protein,
@@ -113,9 +94,6 @@ def get_ppi_neighbors(protein, species, score_threshold=700, delay=1.0):
 
 
 def build_ppi_dict(genes, species="human", score_threshold=700, delay=0.5):
-    """
-    Build a dictionary: gene -> PPI neighbor set.
-    """
     species_map = {"human": 9606, "mouse": 10090}
     tax_id = species_map[species]
     ppi_dict = {}
@@ -143,14 +121,6 @@ def get_embedding_neighbors(adata_gene, target_gene, species="human", top_n=30):
 
 
 def compute_overlap_pval(gene, embedding_neighbors, ppi_neighbors, background_genes):
-    """
-    Hypergeometric test for overlap significance.
-
-    M = number of background genes
-    n = number of PPI neighbors in the background
-    N = number of embedding neighbors
-    k = overlap count
-    """
     ppi_neighbors = set(ppi_neighbors) & set(background_genes)
     embedding_neighbors = set(embedding_neighbors) & set(background_genes)
 
@@ -169,9 +139,6 @@ def compute_overlap_pval(gene, embedding_neighbors, ppi_neighbors, background_ge
 
 
 def batch_compute(adata_gene, ppi_dict, species="human", top_n=30):
-    """
-    Compute overlap statistics for all genes.
-    """
     results = []
     background_genes = adata_gene[adata_gene.obs["species"] == species].obs["gene_id"].unique()
 

@@ -1,5 +1,4 @@
-﻿import numpy as np
-import pandas as pd
+﻿import pandas as pd
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -8,7 +7,7 @@ from scipy.cluster.hierarchy import linkage, leaves_list
 from matplotlib.colors import LinearSegmentedColormap
 
 
-def compute_gene_grad_importance_all(
+def compute_gene_grad_attribution_all(
     model,
     dataloader,
     species,
@@ -16,14 +15,6 @@ def compute_gene_grad_importance_all(
     target_celltype: int = 0,
     focus_on_type: bool = True,
 ):
-    """
-    Compute gene importance scores aggregated across batches.
-
-    Returns
-    -------
-    np.ndarray or None
-        Gene importance vector with shape (n_genes,).
-    """
     scores = []
     counts = []
 
@@ -66,8 +57,8 @@ def compute_gene_grad_importance_all(
             grad_sel = grad
             x_sel = cells_in.detach()
 
-        imp = (grad_sel * x_sel).abs().sum(0).detach().cpu()
-        scores.append(imp)
+        attribution = (grad_sel * x_sel).abs().sum(0).detach().cpu()
+        scores.append(attribution)
         counts.append(int(x_sel.shape[0]))
 
     if not scores:
@@ -81,9 +72,6 @@ def compute_gene_grad_importance_all(
 
 
 def collect_homologous_triplets(homology_indices):
-    """
-    Collect shared human-mouse-marmoset homologous triplets.
-    """
     hm = homology_indices[("human", "mouse")]
     hk = homology_indices[("human", "marmoset")]
 
@@ -98,7 +86,7 @@ def collect_homologous_triplets(homology_indices):
     return triplets
 
 
-def compare_gene_importance_cross_species(
+def compare_gene_attribution_cross_species(
     model,
     dataloader,
     species_config,
@@ -107,22 +95,9 @@ def compare_gene_importance_cross_species(
     target_celltype: int = 0,
     focus_on_type: bool = True,
 ):
-    """
-    Compare homologous gene importance across species for importance_z heatmaps.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with raw importance and z-scored importance:
-        [
-            gene_human, gene_mouse, gene_monkey,
-            imp_h, imp_m, imp_k,
-            imp_h_z, imp_m_z, imp_k_z
-        ]
-    """
     per_species = {}
     for species in ["human", "mouse", "marmoset"]:
-        imp = compute_gene_grad_importance_all(
+        attribution = compute_gene_grad_attribution_all(
             model=model,
             dataloader=dataloader,
             species=species,
@@ -130,7 +105,7 @@ def compare_gene_importance_cross_species(
             target_celltype=target_celltype,
             focus_on_type=focus_on_type,
         )
-        per_species[species] = imp
+        per_species[species] = attribution
 
     if any(v is None for v in per_species.values()):
         return pd.DataFrame()
@@ -144,9 +119,9 @@ def compare_gene_importance_cross_species(
                 "gene_human": species_config["human"]["gene_names"][h_idx],
                 "gene_mouse": species_config["mouse"]["gene_names"][m_idx],
                 "gene_monkey": species_config["marmoset"]["gene_names"][k_idx],
-                "imp_h": float(per_species["human"][h_idx]),
-                "imp_m": float(per_species["mouse"][m_idx]),
-                "imp_k": float(per_species["marmoset"][k_idx]),
+                "attribution_h": float(per_species["human"][h_idx]),
+                "attribution_m": float(per_species["mouse"][m_idx]),
+                "attribution_k": float(per_species["marmoset"][k_idx]),
             }
         )
 
@@ -156,14 +131,14 @@ def compare_gene_importance_cross_species(
 
     eps = 1e-8
     for sp in ["h", "m", "k"]:
-        col = f"imp_{sp}"
+        col = f"attribution_{sp}"
         values = df[col].values.astype(float)
-        df[f"imp_{sp}_z"] = (values - values.mean()) / (values.std() + eps)
+        df[f"attribution_{sp}_z"] = (values - values.mean()) / (values.std() + eps)
 
     return df
 
 
-def plot_importance_heatmap_for_celltype(
+def plot_attribution_heatmap_for_celltype(
     ct2df,
     cell_type,
     top_n=30,
@@ -177,41 +152,11 @@ def plot_importance_heatmap_for_celltype(
     figsize_cm=None,
     gene_whitelist=None,
 ):
-    """
-    Plot a heatmap of z-scored gene importance for one cell type.
-
-    Parameters
-    ----------
-    ct2df
-        Mapping from cell type to DataFrame returned by compare_gene_importance_cross_species.
-    cell_type
-        Target cell type.
-    top_n
-        Number of top positive genes selected per species before union.
-    max_genes
-        Maximum number of genes shown in the heatmap.
-    species_labels
-        Labels for the three species.
-    figsize
-        Figure size in inches.
-    gene_label_col
-        Column used for gene labels.
-    save_pdf_path
-        Output PDF path.
-    pdf_dpi
-        DPI for saving.
-    font_size_base
-        Base font size.
-    figsize_cm
-        Figure size in cm. Overrides figsize if provided.
-    gene_whitelist
-        Optional list of genes to plot directly.
-    """
     if cell_type not in ct2df:
         raise ValueError(f"Cell type {cell_type} not found in ct2df")
 
     df = ct2df[cell_type].copy()
-    value_cols = ("imp_h_z", "imp_m_z", "imp_k_z")
+    value_cols = ("attribution_h_z", "attribution_m_z", "attribution_k_z")
 
     for col in value_cols:
         if col not in df.columns:
@@ -281,7 +226,7 @@ def plot_importance_heatmap_for_celltype(
         linewidths=0.1,
         vmin=0,
         linecolor="white",
-        cbar_kws={"label": "Z-scored importance"},
+        cbar_kws={"label": "Z-scored attribution"},
         ax=ax,
         xticklabels=heat_df.columns,
         yticklabels=heat_df.index,
@@ -297,7 +242,7 @@ def plot_importance_heatmap_for_celltype(
 
     cbar = hm.collections[0].colorbar
     cbar.ax.tick_params(labelsize=tick_fs)
-    cbar.set_label("Z-scored importance", fontsize=axis_label_fs)
+    cbar.set_label("Z-scored attribution", fontsize=axis_label_fs)
 
     plt.tight_layout()
 
